@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/workspace:cached
+    command: sleep infinity
+    networks:
+      - zerobudget-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=zerobudget-owner
+      - POSTGRES_PASSWORD=zerobudget-dev
+      - POSTGRES_DB=zerobudget
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+  postgres:
+    image: postgres:18.1
+    restart: unless-stopped
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./postgres-init:/docker-entrypoint-initdb.d
+    environment:
+      - POSTGRES_USER=zerobudget-owner
+      - POSTGRES_PASSWORD=zerobudget-dev
+      - POSTGRES_DB=zerobudget
+    ports:
+      - "5432:5432"
+    networks:
+      - zerobudget-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zerobudget-owner -d zerobudget"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8.4.0
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - zerobudget-network
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  zerobudget-network:
+    driver: bridge
+

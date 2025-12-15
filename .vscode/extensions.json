@@ -1,0 +1,15 @@
+{
+	"recommendations": [
+		"golang.go",
+		"ms-azuretools.vscode-docker",
+		"cweijan.vscode-postgresql-client2",
+		"redis.redis",
+		"ms-vscode.vscode-json",
+		"eamodio.gitlens",
+		"ms-vscode.test-adapter-converter",
+		"hbenl.vscode-test-explorer",
+		"ms-vscode.go"
+	]
+}
+
+

@@ -1,0 +1,46 @@
+{
+	"name": "ZeroBudget Dev Container",
+	"dockerComposeFile": "docker-compose.yml",
+	"service": "dev",
+	"workspaceFolder": "/workspace",
+	
+	"features": {
+		"ghcr.io/devcontainers/features/git:1": {}
+	},
+	
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"golang.go",
+				"ms-azuretools.vscode-docker",
+				"cweijan.vscode-postgresql-client2",
+				"redis.redis",
+				"ms-vscode.vscode-json"
+			],
+			"settings": {
+				"go.toolsManagement.checkForUpdates": "local",
+				"go.useLanguageServer": true,
+				"go.gopath": "/go",
+				"go.goroot": "/usr/local/go"
+			}
+		}
+	},
+	
+	"forwardPorts": [5432, 6379],
+	"portsAttributes": {
+		"5432": {
+			"label": "PostgreSQL",
+			"onAutoForward": "notify"
+		},
+		"6379": {
+			"label": "Redis",
+			"onAutoForward": "notify"
+		}
+	},
+	
+	"postCreateCommand": "go mod download",
+	
+	"remoteUser": "vscode"
+}
+
+
