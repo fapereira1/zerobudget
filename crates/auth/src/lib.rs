@@ -3,6 +3,9 @@
 //! This crate does not interpret Dex access tokens as API JWTs.
 mod authorization;
 mod oidc;
+mod session;
 
 pub use authorization::{Permission, Policy};
 pub use oidc::{AuthConfig, AuthError, DexAuth, Identity, LoginAttempt};
+
+pub use session::{Session, SessionError, SessionStore};

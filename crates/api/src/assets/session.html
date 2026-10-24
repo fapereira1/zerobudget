@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sessão — ZeroBudget</title>
+  <link rel="stylesheet" href="/auth/session.css">
+  <script src="/auth/session.js" defer></script>
+</head>
+<body>
+  <main>
+    <p>ZeroBudget</p>
+    <h1>Sua sessão</h1>
+    <p>Consulte o login pelo Dex e encerre a sessão desta aplicação.</p>
+    <p id="status" role="status" aria-live="polite">Consultando sessão…</p>
+    <dl id="identity" hidden>
+      <dt>Provedor</dt><dd id="issuer"></dd>
+      <dt>Usuário</dt><dd id="subject"></dd>
+      <dt>Expiração</dt><dd id="expires"></dd>
+    </dl>
+    <nav aria-label="Ações da sessão">
+      <a id="login" href="/api/auth/login">Entrar com Dex</a>
+      <button id="refresh" type="button">Consultar sessão</button>
+      <button id="logout" type="button" disabled>Sair</button>
+    </nav>
+    <p>O logout encerra a sessão do ZeroBudget. A sessão no Dex pode continuar ativa.</p>
+    <noscript>Habilite JavaScript para consultar a sessão e usar o botão Sair.</noscript>
+  </main>
+</body>
+</html>

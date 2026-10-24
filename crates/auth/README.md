@@ -69,25 +69,28 @@ consultas pelo par autenticado. IDs de proprietário enviados pelo cliente não
 são prova de propriedade. `require` e `require_owner` rejeitam identidades
 expiradas, mesmo com permissão cadastrada.
 
-## Integração HTTP ainda necessária
+## Integração HTTP e sessões
 
-Este núcleo não cria endpoints, cookies nem sessões de aplicação. A camada API
-deve implementar login/callback/logout e armazenamento de sessões com expiração
-e revogação, remover tentativas de login após qualquer callback e limitar o
-número de tentativas por navegador e por servidor. Cookies de sessão devem usar
-`HttpOnly`, `Secure` em produção e `SameSite=Lax`; requisições de alteração
-precisam de proteção CSRF. A sessão autenticada não pode ultrapassar
-`Identity::expires_at()` sem nova autenticação.
+O [crate API](../api/README.md) implementa os endpoints de login, callback,
+consulta de identidade e logout, usando `SessionStore` deste crate. O armazenamento
+em memória limita tentativas e sessões, consome tentativas atomicamente, rotaciona
+IDs no login e verifica expiração e CSRF. O adaptador HTTP sincroniza o acesso e
+não mantém o lock durante a comunicação com o Dex.
 
-Mapeamento sugerido: falhas de autenticação → 401; `Forbidden` → 403;
-indisponibilidade do provedor → 503. Erros não carregam códigos, tokens ou
-segredos. Não registrar URL de callback completa nem objetos de protocolo.
+Sessões têm duração absoluta máxima de 30 minutos, limitada pela expiração da
+identidade. Reiniciar o processo revoga todas as sessões. A API usa cookies
+`HttpOnly`, `SameSite=Lax` e `Secure` em HTTPS, além de proteção CSRF para alterações.
+Persistência e coordenação entre múltiplas réplicas ainda não estão implementadas.
 
-As chaves ficam em memória durante a vida de `DexAuth`. Recrie a instância
-periodicamente e troque-a atomicamente para acompanhar a rotação de chaves do
-Dex; chaves desconhecidas são rejeitadas até a atualização. Ainda não há refresh
-automático de JWKS, renovação de sessão, persistência de permissões ou logout
-federado.
+Mapeamento HTTP: falhas de autenticação → 401; `Forbidden` e CSRF → 403;
+indisponibilidade do provedor ou capacidade esgotada → 503. Erros não carregam
+códigos, tokens ou segredos.
+
+As chaves ficam em memória durante a vida de `DexAuth`. A API recria e substitui
+atomicamente a instância a cada cinco minutos para acompanhar a rotação do Dex.
+Chaves desconhecidas são rejeitadas até a atualização. Consumidores independentes
+do crate precisam definir sua própria rotina de atualização. Ainda não há
+renovação de sessão, persistência de permissões ou logout federado.
 
 ## Limites desta etapa
 

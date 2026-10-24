@@ -99,6 +99,11 @@ impl Identity {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_test_expiration(&mut self, expires_at: i64) {
+        self.expires_at = expires_at;
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_test(issuer: &str, subject: &str) -> Self {
         Self {
             issuer: issuer.into(),
@@ -213,7 +218,10 @@ impl DexAuth {
             .set_pkce_verifier(attempt.verifier)
             .request_async(&self.http)
             .await
-            .map_err(|_| AuthError::Exchange)?;
+            .map_err(|error| match error {
+                openidconnect::RequestTokenError::Request(_) => AuthError::Provider,
+                _ => AuthError::Exchange,
+            })?;
         let verifier = client.id_token_verifier();
         verify_response(&response, &verifier, &attempt.nonce)
     }

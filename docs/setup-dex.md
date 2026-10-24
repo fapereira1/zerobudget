@@ -29,13 +29,14 @@ Para usar o núcleo Rust, configure `AuthConfig` com o issuer acima,
 `rust-app`, o segredo local e um callback registrado; habilite explicitamente
 `allow_loopback_http`. Consulte o [contrato do crate auth](../crates/auth/README.md)
 para armazenamento da tentativa de login e validação do callback.
-A API ainda não implementa os endpoints e o armazenamento de sessões.
+A API implementa login, callback, consulta de sessão e logout. Veja o
+[guia da API](../crates/api/README.md) para testar pelo navegador.
 
 O script `scripts/test-oauth2.sh` é uma demonstração manual do protocolo.
 Ele imprime valores sensíveis para facilitar a inspeção local e não substitui
 a validação criptográfica do crate nem deve ser usado em produção.
 
-As variáveis do `.env.example` anterior não são interpoladas pelo YAML atual:
+As variáveis da API no `.env.example` não são interpoladas pelo YAML do Compose:
 para mudar portas, issuer ou senhas, altere a configuração e o Compose de forma
 coerente. Em produção, use HTTPS, segredos externos e um connector real;
 `mockPassword` é apenas para desenvolvimento.

@@ -1,3 +1,46 @@
-fn main() {
-    println!("API");
+use obz_api::{config::Config, router, AppState};
+use obz_auth::DexAuth;
+use std::{sync::Arc, time::Duration};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::from_env()?;
+    let auth = DexAuth::discover(config.auth_config()?).await?;
+    let state = AppState::new(auth, config.origin.clone(), config.secure_cookies);
+    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    println!("ZeroBudget API listening on {}", listener.local_addr()?);
+    let app = router(state.clone());
+    let config = Arc::new(config);
+    let background_state = state.clone();
+    let refresh = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Ok(auth_config) = config.auth_config() else {
+                continue;
+            };
+            match DexAuth::discover(auth_config).await {
+                Ok(auth) => background_state.replace_auth(auth).await,
+                Err(_) => eprintln!("Dex metadata refresh failed; retaining previous signing keys"),
+            }
+        }
+    });
+    let cleanup_state = state;
+    let cleanup = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            cleanup_state.cleanup().await;
+        }
+    });
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await;
+    refresh.abort();
+    cleanup.abort();
+    result?;
+    Ok(())
 }

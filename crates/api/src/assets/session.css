@@ -1,0 +1,14 @@
+:root { font-family: system-ui, sans-serif; color: #162b36; background: #f3f6f5; }
+body { margin: 0; }
+main { max-width: 46rem; margin: 4rem auto; padding: 2rem; background: white; border: 1px solid #d7e0de; border-radius: .75rem; }
+h1 { margin-top: .5rem; }
+p { line-height: 1.6; }
+#status { padding: 1rem; background: #edf5f1; border-radius: .4rem; }
+dt { font-weight: 600; margin-top: 1rem; }
+dd { margin: .25rem 0; overflow-wrap: anywhere; }
+nav { display: flex; align-items: center; flex-wrap: wrap; gap: .75rem; margin: 2rem 0; }
+a { color: #12614b; }
+button { font: inherit; padding: .6rem 1rem; border: 1px solid #b8c9c3; border-radius: .4rem; background: white; cursor: pointer; }
+button:disabled { cursor: default; opacity: .5; }
+button:focus-visible, a:focus-visible { outline: 3px solid #12614b; outline-offset: 3px; }
+@media (max-width: 50rem) { main { margin: 1rem; padding: 1.25rem; } }
