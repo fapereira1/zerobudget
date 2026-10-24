@@ -16,6 +16,21 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:${AUTH_REDIS_PORT:-6380}:6379"
+    volumes:
+      - auth_redis_data:/data
+    networks:
+      - auth-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   dex:
     image: dexidp/dex:v2.37.0
     container_name: dex-server
@@ -38,3 +53,4 @@ networks:
 
 volumes:
   postgres_data:
+  auth_redis_data:

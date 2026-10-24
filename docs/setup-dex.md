@@ -1,6 +1,6 @@
 # Dex para desenvolvimento local
 
-O Compose executa Dex e PostgreSQL. Requer Docker com Docker Compose.
+O Compose executa Dex, PostgreSQL e Redis para as sessões da aplicação. Requer Docker com Docker Compose.
 
 ```bash
 docker compose up -d
@@ -36,7 +36,8 @@ O script `scripts/test-oauth2.sh` é uma demonstração manual do protocolo.
 Ele imprime valores sensíveis para facilitar a inspeção local e não substitui
 a validação criptográfica do crate nem deve ser usado em produção.
 
-As variáveis da API no `.env.example` não são interpoladas pelo YAML do Compose:
+O Compose usa `AUTH_REDIS_PORT` para a porta local do Redis (6380 por padrão).
+As demais variáveis da API no `.env.example` não alteram a configuração do Dex:
 para mudar portas, issuer ou senhas, altere a configuração e o Compose de forma
 coerente. Em produção, use HTTPS, segredos externos e um connector real;
 `mockPassword` é apenas para desenvolvimento.
@@ -81,3 +82,11 @@ Para testar uma rejeição, execute novamente e altere o valor de `state` na
 URL colada: deve retornar `InvalidLogin`. Cada execução precisa de um novo
 login; códigos são de uso único. `cargo test -p obz-auth` cobre adicionalmente
 assinaturas e claims inválidos sem depender do Docker.
+
+## Instância alternativa para testes
+
+O cliente `rust-app` também registra `http://localhost:3001/api/auth/callback`.
+Isso permite validar uma API de teste na porta 3001 sem encerrar uma instância
+existente em 3000. Depois de alterar a configuração do cliente, reinicie somente
+Dex com `docker compose restart dex`. A API de teste precisa configurar
+`API_BIND=127.0.0.1:3001` e `API_PUBLIC_URL=http://localhost:3001`.

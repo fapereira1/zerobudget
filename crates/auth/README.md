@@ -71,19 +71,26 @@ expiradas, mesmo com permissão cadastrada.
 
 ## Integração HTTP e sessões
 
-O [crate API](../api/README.md) implementa os endpoints de login, callback,
-consulta de identidade e logout, usando `SessionStore` deste crate. O armazenamento
-em memória limita tentativas e sessões, consome tentativas atomicamente, rotaciona
-IDs no login e verifica expiração e CSRF. O adaptador HTTP sincroniza o acesso e
-não mantém o lock durante a comunicação com o Dex.
+O [crate API](../api/README.md) implementa login, callback, consulta de identidade
+e logout por meio do contrato assíncrono `SessionStore`. `MemorySessionStore`
+é o backend explícito de desenvolvimento; `RedisSessionStore` compartilha sessões
+e tentativas entre instâncias. A API não mantém um mutex global de armazenamento.
 
 Sessões têm duração absoluta máxima de 30 minutos, limitada pela expiração da
-identidade. Reiniciar o processo revoga todas as sessões. A API usa cookies
-`HttpOnly`, `SameSite=Lax` e `Secure` em HTTPS, além de proteção CSRF para alterações.
-Persistência e coordenação entre múltiplas réplicas ainda não estão implementadas.
+identidade. Tentativas duram até cinco minutos e são consumidas uma única vez,
+inclusive entre réplicas. O Redis usa registros internos versionados, TTL,
+chaves derivadas por SHA-256, admissão atômica de capacidade e revogação de sessão.
+A reconstrução de identidade é restrita ao módulo de armazenamento confiável;
+`Identity` não implementa `Deserialize` público.
+
+Reiniciar a API preserva os registros do Redis. Memória continua sendo por
+processo e perde as sessões no reinício. Não há fallback automático se Redis
+falhar. O adaptador usa cookies `HttpOnly`, `SameSite=Lax`, `Secure` em HTTPS e
+proteção CSRF para alterações. Consulte o guia da API para configuração e
+limitações de durabilidade do Redis, namespaces, ACL e recuperação de backups.
 
 Mapeamento HTTP: falhas de autenticação → 401; `Forbidden` e CSRF → 403;
-indisponibilidade do provedor ou capacidade esgotada → 503. Erros não carregam
+indisponibilidade do provedor/armazenamento ou capacidade esgotada → 503. Erros não carregam
 códigos, tokens ou segredos.
 
 As chaves ficam em memória durante a vida de `DexAuth`. A API recria e substitui
@@ -107,6 +114,7 @@ rotas de negócio. A versão do Dex configurada no Compose não fornece o fluxo
 ```bash
 cargo test -p obz-auth
 cargo clippy -p obz-auth --all-targets -- -D warnings
+AUTH_TEST_REDIS_URL=redis://127.0.0.1:6380/0 cargo test -p obz-auth -- --include-ignored
 ```
 
 Os testes cobrem PKCE, state, prazo do login, configuração TLS, tokens RS256

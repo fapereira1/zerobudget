@@ -7,4 +7,4 @@ Aplicação Rust de gestão financeira pessoal com orçamento base zero.
 - [Autenticação e autorização de usuários](crates/auth/README.md)
 - [Dex para desenvolvimento local](docs/setup-dex.md)
 
-- [Plano do próximo passo de autenticação](docs/proximo-passo-auth.md)
+- [Entrega de sessões compartilhadas e próximos passos](docs/proximo-passo-auth.md)

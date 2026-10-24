@@ -1,14 +1,16 @@
-//! Bounded, single-process storage. Secrets never implement Debug or Serialize.
+//! Server-side storage contract. Backends never expose serializable identities.
 use crate::{Identity, LoginAttempt};
+use async_trait::async_trait;
 use openidconnect::CsrfToken;
 use std::{
     collections::HashMap,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
+use tokio::sync::Mutex;
 
-const LOGIN_TTL: Duration = Duration::from_secs(300);
-const SESSION_TTL: u64 = 1800;
+pub(crate) const LOGIN_TTL: u64 = 300;
+pub(crate) const SESSION_TTL: u64 = 1800;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SessionError {
@@ -18,12 +20,17 @@ pub enum SessionError {
     Invalid,
     #[error("invalid CSRF token")]
     Csrf,
+    #[error("session storage unavailable")]
+    Unavailable,
+    #[error("invalid session storage configuration")]
+    Configuration,
 }
 
+#[derive(Clone)]
 pub struct Session {
-    identity: Identity,
-    csrf: String,
-    expires_at: u64,
+    pub(crate) identity: Identity,
+    pub(crate) csrf: String,
+    pub(crate) expires_at: u64,
 }
 impl Session {
     pub fn identity(&self) -> &Identity {
@@ -42,76 +49,7 @@ impl Session {
             Err(SessionError::Csrf)
         }
     }
-}
-struct PendingLogin {
-    attempt: LoginAttempt,
-    created_at: Instant,
-}
-
-/// The caller synchronizes access and must not hold a lock during provider I/O.
-pub struct SessionStore {
-    pending: HashMap<String, PendingLogin>,
-    sessions: HashMap<String, Session>,
-    max_pending: usize,
-    max_sessions: usize,
-}
-impl Default for SessionStore {
-    fn default() -> Self {
-        Self::new(1024, 4096)
-    }
-}
-impl SessionStore {
-    pub fn new(max_pending: usize, max_sessions: usize) -> Self {
-        Self {
-            pending: HashMap::new(),
-            sessions: HashMap::new(),
-            max_pending,
-            max_sessions,
-        }
-    }
-    pub fn cleanup(&mut self) {
-        self.pending
-            .retain(|_, pending| pending.created_at.elapsed() < LOGIN_TTL);
-        let now = unix_now();
-        self.sessions.retain(|_, session| session.expires_at > now);
-    }
-    pub fn start_login(
-        &mut self,
-        attempt: LoginAttempt,
-        previous: Option<&str>,
-    ) -> Result<String, SessionError> {
-        self.cleanup();
-        if let Some(previous) = previous {
-            self.pending.remove(previous);
-        }
-        if self.pending.len() >= self.max_pending {
-            return Err(SessionError::Capacity);
-        }
-        let id = random_secret();
-        self.pending.insert(
-            id.clone(),
-            PendingLogin {
-                attempt,
-                created_at: Instant::now(),
-            },
-        );
-        Ok(id)
-    }
-    /// Atomic removal binds a login to the browser cookie and prevents callback replay.
-    pub fn take_login(&mut self, id: &str) -> Result<LoginAttempt, SessionError> {
-        self.cleanup();
-        self.pending
-            .remove(id)
-            .map(|pending| pending.attempt)
-            .ok_or(SessionError::Invalid)
-    }
-    /// Never reuse a caller-supplied session ID. Rotate on every successful login.
-    pub fn authenticate(
-        &mut self,
-        identity: Identity,
-        previous: Option<&str>,
-    ) -> Result<(String, u64), SessionError> {
-        self.cleanup();
+    pub(crate) fn new(identity: Identity) -> Result<Self, SessionError> {
         let now = unix_now();
         let expires_at = u64::try_from(identity.expires_at())
             .map_err(|_| SessionError::Invalid)?
@@ -119,37 +57,144 @@ impl SessionStore {
         if expires_at <= now {
             return Err(SessionError::Invalid);
         }
-        if let Some(previous) = previous {
-            self.sessions.remove(previous);
+        Ok(Self {
+            identity,
+            csrf: random_secret(),
+            expires_at,
+        })
+    }
+}
+
+/// Every backend must consume attempts once, rotate IDs, enforce absolute
+/// expiration and capacity, and fail closed. No provider I/O belongs in a lock.
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    async fn start_login(
+        &self,
+        attempt: LoginAttempt,
+        previous: Option<&str>,
+    ) -> Result<String, SessionError>;
+    async fn take_login(&self, id: &str) -> Result<LoginAttempt, SessionError>;
+    async fn authenticate(
+        &self,
+        identity: Identity,
+        previous: Option<&str>,
+    ) -> Result<(String, u64), SessionError>;
+    async fn get(&self, id: &str) -> Result<Session, SessionError>;
+    async fn logout(&self, id: &str, csrf: &str) -> Result<(), SessionError>;
+    async fn cleanup(&self) -> Result<(), SessionError>;
+}
+
+struct MemoryState {
+    pending: HashMap<String, LoginAttempt>,
+    sessions: HashMap<String, Session>,
+}
+impl MemoryState {
+    fn cleanup(&mut self) {
+        let now = unix_now();
+        self.pending.retain(|_, pending| pending.expires_at > now);
+        self.sessions.retain(|_, session| session.expires_at > now);
+    }
+}
+/// Explicit single-process backend for tests and development.
+pub struct MemorySessionStore {
+    state: Mutex<MemoryState>,
+    max_pending: usize,
+    max_sessions: usize,
+}
+impl Default for MemorySessionStore {
+    fn default() -> Self {
+        Self::new(1024, 4096)
+    }
+}
+impl MemorySessionStore {
+    pub fn new(max_pending: usize, max_sessions: usize) -> Self {
+        Self {
+            state: Mutex::new(MemoryState {
+                pending: HashMap::new(),
+                sessions: HashMap::new(),
+            }),
+            max_pending,
+            max_sessions,
         }
-        if self.sessions.len() >= self.max_sessions {
+    }
+}
+#[async_trait]
+impl SessionStore for MemorySessionStore {
+    async fn start_login(
+        &self,
+        attempt: LoginAttempt,
+        previous: Option<&str>,
+    ) -> Result<String, SessionError> {
+        if attempt.expires_at <= unix_now() {
+            return Err(SessionError::Invalid);
+        }
+        let mut state = self.state.lock().await;
+        state.cleanup();
+        let replacing = previous.is_some_and(|id| state.pending.contains_key(id));
+        if state.pending.len() >= self.max_pending && !replacing {
             return Err(SessionError::Capacity);
         }
         let id = random_secret();
-        self.sessions.insert(
-            id.clone(),
-            Session {
-                identity,
-                csrf: random_secret(),
-                expires_at,
-            },
-        );
-        Ok((id, expires_at - now))
+        state.pending.insert(id.clone(), attempt);
+        if let Some(previous) = previous {
+            state.pending.remove(previous);
+        }
+        Ok(id)
     }
-    pub fn get(&mut self, id: &str) -> Result<&Session, SessionError> {
-        self.cleanup();
-        self.sessions.get(id).ok_or(SessionError::Invalid)
+    async fn take_login(&self, id: &str) -> Result<LoginAttempt, SessionError> {
+        let mut state = self.state.lock().await;
+        state.cleanup();
+        state.pending.remove(id).ok_or(SessionError::Invalid)
     }
-    pub fn logout(&mut self, id: &str, csrf: &str) -> Result<(), SessionError> {
-        self.get(id)?.verify_csrf(csrf)?;
-        self.sessions.remove(id);
+    async fn authenticate(
+        &self,
+        identity: Identity,
+        previous: Option<&str>,
+    ) -> Result<(String, u64), SessionError> {
+        let session = Session::new(identity)?;
+        let mut state = self.state.lock().await;
+        state.cleanup();
+        let replacing = previous.is_some_and(|id| state.sessions.contains_key(id));
+        if state.sessions.len() >= self.max_sessions && !replacing {
+            return Err(SessionError::Capacity);
+        }
+        let id = random_secret();
+        let remaining = session.expires_at.saturating_sub(unix_now());
+        if remaining == 0 {
+            return Err(SessionError::Invalid);
+        }
+        state.sessions.insert(id.clone(), session);
+        if let Some(previous) = previous {
+            state.sessions.remove(previous);
+        }
+        Ok((id, remaining))
+    }
+    async fn get(&self, id: &str) -> Result<Session, SessionError> {
+        let mut state = self.state.lock().await;
+        state.cleanup();
+        state.sessions.get(id).cloned().ok_or(SessionError::Invalid)
+    }
+    async fn logout(&self, id: &str, csrf: &str) -> Result<(), SessionError> {
+        let mut state = self.state.lock().await;
+        state.cleanup();
+        state
+            .sessions
+            .get(id)
+            .ok_or(SessionError::Invalid)?
+            .verify_csrf(csrf)?;
+        state.sessions.remove(id);
+        Ok(())
+    }
+    async fn cleanup(&self) -> Result<(), SessionError> {
+        self.state.lock().await.cleanup();
         Ok(())
     }
 }
-fn random_secret() -> String {
+pub(crate) fn random_secret() -> String {
     CsrfToken::new_random().secret().to_owned()
 }
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(u64::MAX, |time| time.as_secs())
@@ -158,45 +203,42 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn identity() -> Identity {
-        Identity::for_test("https://dex.example", "alice")
-    }
-
-    #[test]
-    fn session_rotates_csrf_is_required_and_logout_revokes() {
-        let mut store = SessionStore::default();
-        let (first, lifetime) = store.authenticate(identity(), None).unwrap();
-        assert!(lifetime <= SESSION_TTL);
-        let csrf = store.get(&first).unwrap().csrf_token().to_owned();
-        assert_eq!(store.logout(&first, "wrong"), Err(SessionError::Csrf));
-        assert!(store.get(&first).is_ok());
-        let (second, _) = store.authenticate(identity(), Some(&first)).unwrap();
-        assert_ne!(first, second);
-        assert!(store.get(&first).is_err());
-        assert_eq!(store.logout(&second, &csrf), Err(SessionError::Csrf));
-        let csrf = store.get(&second).unwrap().csrf_token().to_owned();
-        store.logout(&second, &csrf).unwrap();
-        assert!(store.get(&second).is_err());
-    }
-    #[test]
-    fn session_capacity_and_expiration_are_enforced() {
-        let mut store = SessionStore::new(1, 1);
-        let (id, _) = store.authenticate(identity(), None).unwrap();
-        assert_eq!(
-            store.authenticate(identity(), None).unwrap_err(),
-            SessionError::Capacity
-        );
-        store.sessions.get_mut(&id).unwrap().expires_at = 1;
-        assert!(store.get(&id).is_err());
-        assert!(store.authenticate(identity(), None).is_ok());
-    }
-    #[test]
-    fn lifetime_does_not_exceed_identity_expiration() {
-        let mut store = SessionStore::default();
-        let mut identity = identity();
-        identity.set_test_expiration((unix_now() + 10) as i64);
-        let (id, lifetime) = store.authenticate(identity, None).unwrap();
-        assert!(lifetime <= 10);
-        assert!(store.get(&id).unwrap().expires_at() <= unix_now() + 10);
+    #[tokio::test]
+    async fn expiration_releases_memory_capacity() {
+        let store = MemorySessionStore::new(1, 1);
+        let (id, _) = store
+            .authenticate(Identity::for_test("https://dex.example", "alice"), None)
+            .await
+            .unwrap();
+        store
+            .state
+            .lock()
+            .await
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .expires_at = 1;
+        assert!(store.get(&id).await.is_err());
+        assert!(store
+            .authenticate(Identity::for_test("https://dex.example", "alice"), None)
+            .await
+            .is_ok());
+        let id = store
+            .start_login(LoginAttempt::for_test(), None)
+            .await
+            .unwrap();
+        store
+            .state
+            .lock()
+            .await
+            .pending
+            .get_mut(&id)
+            .unwrap()
+            .expires_at = 1;
+        assert!(store.take_login(&id).await.is_err());
+        assert!(store
+            .start_login(LoginAttempt::for_test(), None)
+            .await
+            .is_ok());
     }
 }

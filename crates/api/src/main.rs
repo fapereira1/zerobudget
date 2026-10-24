@@ -6,7 +6,8 @@ use std::{sync::Arc, time::Duration};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let auth = DexAuth::discover(config.auth_config()?).await?;
-    let state = AppState::new(auth, config.origin.clone(), config.secure_cookies);
+    let store = config.session_store().await?;
+    let state = AppState::new(auth, config.origin.clone(), config.secure_cookies, store);
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     println!("ZeroBudget API listening on {}", listener.local_addr()?);
     let app = router(state.clone());
@@ -31,7 +32,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
-            cleanup_state.cleanup().await;
+            if cleanup_state.cleanup().await.is_err() {
+                eprintln!("Session storage cleanup unavailable");
+            }
         }
     });
     let result = axum::serve(listener, app)

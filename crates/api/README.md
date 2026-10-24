@@ -10,8 +10,9 @@ Na raiz do workspace:
 
 ```bash
 docker compose up -d
-AUTH_ALLOW_LOCAL_HTTP=true \
-DEX_CLIENT_SECRET=secret-rust-app-key \
+set -a
+. ./.env.example
+set +a
 cargo run -p obz-api
 ```
 
@@ -55,8 +56,16 @@ provedor upstream. Um novo login pode aproveitar o SSO existente no Dex.
 | `DEX_CLIENT_ID` | `rust-app` | Cliente registrado no Dex |
 | `DEX_CLIENT_SECRET` | obrigatório | Segredo do cliente; não é registrado em logs |
 | `AUTH_ALLOW_LOCAL_HTTP` | `false` | Exceção explícita de desenvolvimento para HTTP em loopback |
+| `AUTH_SESSION_BACKEND` | obrigatório | `redis` ou `memory`; memória exige modo local explícito |
+| `AUTH_REDIS_URL` | obrigatório para Redis | Local: `redis://127.0.0.1:6380/0`; produção: `rediss://` autenticado |
+| `AUTH_REDIS_NAMESPACE` | obrigatório para Redis | Identificador exclusivo por aplicação, issuer, cliente e ambiente |
+| `AUTH_REDIS_TIMEOUT_MS` | `3000` | Timeout de conexão e operações; intervalo permitido: 1 a 30000 ms |
+| `AUTH_MAX_PENDING` | `1024` | Capacidade de tentativas compartilhada pelo namespace |
+| `AUTH_MAX_SESSIONS` | `4096` | Capacidade de sessões compartilhada pelo namespace |
 
 A aplicação lê variáveis do ambiente; não carrega `.env` automaticamente.
+O exemplo acima exporta apenas a configuração local de `.env.example`; em
+produção, forneça os valores pelo ambiente de implantação.
 O callback é sempre `${API_PUBLIC_URL}/api/auth/callback` e precisa estar
 registrado no Dex. Em produção, configure origem pública e issuer HTTPS,
 forneça o segredo externamente e mantenha `AUTH_ALLOW_LOCAL_HTTP=false`.
@@ -70,6 +79,9 @@ Terminação TLS pode ocorrer no proxy; a origem pública configurada determina
 - `state`, `nonce` e o verificador PKCE permanecem na memória do servidor.
   A tentativa é selecionada pelo cookie do navegador, removida atomicamente
   antes da troca do código e invalidada mesmo em callbacks recusados ou malformados.
+- As chaves Redis usam SHA-256 dos IDs opacos; os payloads são internos e
+  versionados. Uma identidade não pode ser reconstruída a partir de claims
+  fornecidos por uma requisição.
 - A sessão usa um ID opaco aleatório e é rotacionada após cada login válido.
   A sessão anterior do mesmo navegador é revogada quando houver um novo login.
 - A duração absoluta máxima é de 30 minutos e nunca ultrapassa a expiração do
@@ -82,15 +94,58 @@ Terminação TLS pode ocorrer no proxy; a origem pública configurada determina
   O login não concede permissões financeiras automaticamente.
 - Respostas usam `Cache-Control: no-store`, `Referrer-Policy: no-referrer` e
   `X-Content-Type-Options: nosniff`. Tokens, cookies e URLs de callback não são logados.
-- O armazenamento aceita no máximo 1.024 tentativas e 4.096 sessões por processo.
-  Entradas expiradas são removidas em acessos e a cada minuto; capacidade esgotada
-  retorna 503. O proxy de produção deve também limitar a taxa de login.
+- Os limites padrão são 1.024 tentativas e 4.096 sessões, configuráveis pelo ambiente.
+  Os limites são por namespace no Redis, com admissão atômica entre instâncias.
+  TTL remove registros expirados; índices de capacidade são limpos nas escritas
+  e a cada minuto. Capacidade esgotada retorna 503. O proxy de produção deve
+  também limitar a taxa de login.
 - Descoberta e JWKS são atualizados a cada cinco minutos. Uma falha mantém as
   últimas chaves disponíveis; chaves desconhecidas continuam rejeitadas.
 
-O armazenamento é **em memória e por processo**: reiniciar a API encerra sessões
-e tentativas. Esta implementação atende uma única instância; persistência e
-armazenamento compartilhado para múltiplas réplicas ficam para uma etapa posterior.
+## Armazenamento compartilhado
+
+`AUTH_SESSION_BACKEND=redis` guarda sessões e tentativas fora do processo da
+API. Reiniciar somente a API preserva registros ainda válidos. Sessões antigas
+do backend em memória não são migradas: ao adotar Redis, faça novo login. Réplicas devem
+usar o mesmo namespace, issuer, client ID, origem pública e limites de capacidade.
+O backend recusa limites incompatíveis entre instâncias no mesmo namespace.
+Para mudar limites, faça uma migração coordenada para um novo namespace;
+identificadores antigos deixam de ser aceitos.
+
+Login usa consumo atômico da tentativa, e a rotação da sessão revoga o ID
+anterior na mesma operação de escrita. Logout verifica CSRF e remove a versão
+exata da sessão consultada. Uma falha de rede não provoca repetição automática
+da operação pela aplicação: se a resposta do consumo se perder, a tentativa
+pode ter sido consumida e o usuário precisará iniciar um novo login.
+
+Conexão e operações têm timeout. Redis indisponível retorna 503 para operações
+que dependem da sessão; sessão ausente, expirada ou registro incompatível retorna
+401. Não há fallback automático para memória. `/health` continua sendo apenas
+liveness, sem testar prontidão do Redis.
+
+O serviço do Compose é acessível em `127.0.0.1:6380`, sem alterar um Redis
+existente em 6379. `AUTH_REDIS_PORT` muda a porta publicada; ajuste também
+`AUTH_REDIS_URL`. Acesso sem TLS é permitido somente no modo local explícito,
+por URL em loopback. O Compose é uma configuração de desenvolvimento; uma API
+em container deve usar uma conexão autenticada com TLS ou um adaptador de
+infraestrutura apropriado, em vez de desativar a validação TLS.
+
+O Compose usa volume próprio, AOF com `appendfsync everysec`, limite de memória
+de 128 MB e `noeviction`. Isso não garante perda zero no crash do Redis nem
+alta disponibilidade. Em produção, configure ACL restrita ao namespace,
+credenciais externas, rede privada, TLS com certificado confiável e a política
+de durabilidade exigida. Mantenha os relógios das instâncias e do Redis sincronizados: a aplicação
+verifica os prazos absolutos além do TTL. Os payloads contêm identidade, CSRF, nonce e
+verificador PKCE; o armazenamento e seus backups são confiáveis e sensíveis.
+
+Perda do armazenamento invalida as sessões ausentes. Restaurar um backup antigo
+pode restaurar sessões já revogadas: após recuperação com possível perda de
+escritas, altere o namespace antes de reabrir acesso e exija novo login.
+Não trate Redis de autenticação como cache descartável com recomposição local.
+
+Para testes isolados ou desenvolvimento sem Redis, selecione explicitamente
+`AUTH_SESSION_BACKEND=memory` com `AUTH_ALLOW_LOCAL_HTTP=true`. Nesse backend,
+reiniciar a API encerra todas as sessões e cada instância tem estado próprio.
 Não há logout federado, renovação silenciosa ou autenticação de serviços.
 
 ## Testes
@@ -98,13 +153,23 @@ Não há logout federado, renovação silenciosa ou autenticação de serviços.
 ```bash
 cargo test -p obz-api -p obz-auth
 cargo clippy -p obz-api -p obz-auth --all-targets -- -D warnings
+
+# Inclui os testes de integração com Redis real:
+docker compose up -d redis
+AUTH_TEST_REDIS_URL=redis://127.0.0.1:6380/0 \
+cargo test -p obz-api -p obz-auth -- --include-ignored
 ```
 
 Os testes HTTP iniciam um provedor OIDC temporário em loopback, com descoberta,
 JWKS, tokens RSA assinados e verificação de PKCE no endpoint de troca. Verificam
 login/callback/me/logout, cookies seguros, vinculação ao navegador, callback de
 uso único, callbacks inválidos, CSRF, origem, expiração e limite de capacidade.
-Não exigem Docker; exigem permissão para abrir portas locais temporárias.
+A suíte padrão não exige Docker, mas abre portas locais temporárias. Os testes
+Redis são marcados como ignorados por padrão e precisam de `AUTH_TEST_REDIS_URL`
+e `--include-ignored`. Cada teste usa namespace exclusivo e limpa somente suas
+próprias chaves, sem `FLUSHDB`. Eles cobrem concorrência, reinicialização do
+backend, capacidade global, registros inválidos, TTL, revogação e uma falha de
+transporte injetada por um proxy local, sem interromper o Redis compartilhado.
 
 Referências: [Axum](https://docs.rs/axum/0.8.9/axum/),
 [OWASP: sessões](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html),

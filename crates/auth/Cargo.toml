@@ -7,6 +7,12 @@ edition = "2021"
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
 thiserror = "2"
 subtle = "2"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+redis = { version = "0.32.7", default-features = false, features = ["tokio-rustls-comp", "connection-manager", "script"] }
+tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
 chrono = "0.4"

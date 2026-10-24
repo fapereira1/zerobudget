@@ -3,9 +3,16 @@
 //! This crate does not interpret Dex access tokens as API JWTs.
 mod authorization;
 mod oidc;
+mod records;
+mod redis_store;
 mod session;
 
 pub use authorization::{Permission, Policy};
 pub use oidc::{AuthConfig, AuthError, DexAuth, Identity, LoginAttempt};
 
-pub use session::{Session, SessionError, SessionStore};
+pub use session::{MemorySessionStore, Session, SessionError, SessionStore};
+
+pub use redis_store::{RedisSessionStore, RedisStoreConfig};
+
+#[cfg(test)]
+mod storage_contract;

@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use openidconnect::{
     core::{
@@ -98,6 +98,23 @@ impl Identity {
         self.expires_at
     }
 
+    pub(crate) fn from_stored(
+        issuer: String,
+        subject: String,
+        expires_at: i64,
+    ) -> Result<Self, crate::SessionError> {
+        let parsed = IssuerUrl::new(issuer.clone()).map_err(|_| crate::SessionError::Invalid)?;
+        validate_url(parsed.url(), true).map_err(|_| crate::SessionError::Invalid)?;
+        if subject.is_empty() || subject.len() > 4096 || expires_at <= 0 {
+            return Err(crate::SessionError::Invalid);
+        }
+        Ok(Self {
+            issuer,
+            subject,
+            expires_at,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_expiration(&mut self, expires_at: i64) {
         self.expires_at = expires_at;
@@ -113,18 +130,45 @@ impl Identity {
     }
 }
 
-/// Store server-side, bound to the initiating browser session. Do not log or serialize.
+/// Store server-side, bound to the initiating browser session. Never expose or log secrets.
 /// Consumed by `finish_login`, including on errors, to prevent reuse.
 pub struct LoginAttempt {
     state: CsrfToken,
     nonce: Nonce,
     verifier: PkceCodeVerifier,
-    created_at: Instant,
+    pub(crate) expires_at: u64,
 }
 
 impl LoginAttempt {
+    pub(crate) fn into_record(self) -> crate::records::LoginRecord {
+        crate::records::LoginRecord {
+            version: 1,
+            state: self.state.secret().to_owned(),
+            nonce: self.nonce.secret().to_owned(),
+            verifier: self.verifier.secret().to_owned(),
+            expires_at: self.expires_at,
+        }
+    }
+    pub(crate) fn from_record(record: crate::records::LoginRecord) -> Self {
+        Self {
+            state: CsrfToken::new(record.state),
+            nonce: Nonce::new(record.nonce),
+            verifier: PkceCodeVerifier::new(record.verifier),
+            expires_at: record.expires_at,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (_, verifier) = PkceCodeChallenge::new_random_sha256();
+        Self {
+            state: CsrfToken::new_random(),
+            nonce: Nonce::new_random(),
+            verifier,
+            expires_at: crate::session::unix_now() + 300,
+        }
+    }
     fn validate(&self, state: &str) -> Result<(), AuthError> {
-        if self.created_at.elapsed() > Duration::from_secs(300)
+        if self.expires_at <= crate::session::unix_now()
             || !bool::from(self.state.secret().as_bytes().ct_eq(state.as_bytes()))
         {
             return Err(AuthError::InvalidLogin);
@@ -189,7 +233,7 @@ impl DexAuth {
                 state,
                 nonce,
                 verifier,
-                created_at: Instant::now(),
+                expires_at: crate::session::unix_now().saturating_add(300),
             },
         )
     }
@@ -300,11 +344,11 @@ mod tests {
             state: CsrfToken::new("expected".into()),
             nonce: Nonce::new_random(),
             verifier,
-            created_at: Instant::now(),
+            expires_at: crate::session::unix_now().saturating_add(300),
         };
         assert!(attempt.validate("expected").is_ok());
         assert!(attempt.validate("wrong").is_err());
-        attempt.created_at = Instant::now() - Duration::from_secs(301);
+        attempt.expires_at = crate::session::unix_now().saturating_sub(1);
         assert!(attempt.validate("expected").is_err());
     }
     fn signed_response(

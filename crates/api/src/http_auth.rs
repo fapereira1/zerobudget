@@ -9,20 +9,25 @@ use axum::{
 use obz_auth::{AuthError, DexAuth, Identity, SessionError, SessionStore};
 use serde::Serialize;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct AppState {
     auth: Arc<RwLock<Arc<DexAuth>>>,
-    store: Arc<Mutex<SessionStore>>,
+    store: Arc<dyn SessionStore>,
     origin: Arc<str>,
     secure: bool,
 }
 impl AppState {
-    pub fn new(auth: DexAuth, origin: String, secure_cookies: bool) -> Self {
+    pub fn new(
+        auth: DexAuth,
+        origin: String,
+        secure_cookies: bool,
+        store: Arc<dyn SessionStore>,
+    ) -> Self {
         Self {
             auth: Arc::new(RwLock::new(Arc::new(auth))),
-            store: Arc::new(Mutex::new(SessionStore::default())),
+            store,
             origin: origin.into(),
             secure: secure_cookies,
         }
@@ -30,8 +35,8 @@ impl AppState {
     pub async fn replace_auth(&self, auth: DexAuth) {
         *self.auth.write().await = Arc::new(auth);
     }
-    pub async fn cleanup(&self) {
-        self.store.lock().await.cleanup();
+    pub async fn cleanup(&self) -> Result<(), SessionError> {
+        self.store.cleanup().await
     }
     fn login_cookie(&self) -> &'static str {
         if self.secure {
@@ -129,6 +134,14 @@ impl From<SessionError> for ApiError {
             ),
             SessionError::Invalid => Self(StatusCode::UNAUTHORIZED, "invalid or expired session"),
             SessionError::Csrf => Self(StatusCode::FORBIDDEN, "invalid CSRF token"),
+            SessionError::Unavailable => Self(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session storage unavailable",
+            ),
+            SessionError::Configuration => Self(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session storage configuration error",
+            ),
         }
     }
 }
@@ -180,9 +193,8 @@ async fn login(State(state): State<AppState>, headers: HeaderMap) -> Result<Resp
     let (url, attempt) = auth.begin_login();
     let id = state
         .store
-        .lock()
-        .await
-        .start_login(attempt, previous.as_deref())?;
+        .start_login(attempt, previous.as_deref())
+        .await?;
     let mut response = Redirect::to(url.as_str()).into_response();
     state.set_cookie(&mut response, state.login_cookie(), &id, 300);
     Ok(response)
@@ -232,16 +244,15 @@ async fn finish_callback(
 ) -> Result<Response, ApiError> {
     let id = cookie(headers, state.login_cookie())?.ok_or(SessionError::Invalid)?;
     // Remove even if the provider rejected consent or callback parameters are malformed.
-    let attempt = state.store.lock().await.take_login(&id)?;
+    let attempt = state.store.take_login(&id).await?;
     let (returned_state, code) = callback_parameters(query)?;
     let previous = cookie(headers, state.session_cookie())?;
     let auth = state.auth.read().await.clone();
     let identity = auth.finish_login(attempt, &returned_state, code).await?;
     let (session, max_age) = state
         .store
-        .lock()
-        .await
-        .authenticate(identity, previous.as_deref())?;
+        .authenticate(identity, previous.as_deref())
+        .await?;
     let mut response = Redirect::to("/auth/session").into_response();
     state.set_cookie(&mut response, state.session_cookie(), &session, max_age);
     Ok(response)
@@ -261,8 +272,7 @@ impl FromRequestParts<AppState> for Authenticated {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let id = cookie(&parts.headers, state.session_cookie())?.ok_or(SessionError::Invalid)?;
-        let mut store = state.store.lock().await;
-        let session = store.get(&id)?;
+        let session = state.store.get(&id).await?;
         if !matches!(
             parts.method,
             axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
@@ -315,7 +325,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
     verify_origin(&headers, &state)?;
     let id = cookie(&headers, state.session_cookie())?.ok_or(SessionError::Invalid)?;
     let csrf = csrf_header(&headers)?;
-    state.store.lock().await.logout(&id, csrf)?;
+    state.store.logout(&id, csrf).await?;
     let mut response = StatusCode::NO_CONTENT.into_response();
     state.set_cookie(&mut response, state.session_cookie(), "", 0);
     Ok(response)
@@ -462,7 +472,12 @@ mod tests {
             )
             .await
             .unwrap();
-            let state = AppState::new(auth, "http://localhost:3000".into(), secure);
+            let state = AppState::new(
+                auth,
+                "http://localhost:3000".into(),
+                secure,
+                Arc::new(obz_auth::MemorySessionStore::default()),
+            );
             Self {
                 state,
                 provider,
@@ -702,7 +717,7 @@ mod tests {
     }
     #[tokio::test]
     async fn expired_identity_does_not_create_a_session_and_capacity_is_bounded() {
-        let fixture = Fixture::new(false, -300).await;
+        let mut fixture = Fixture::new(false, -300).await;
         let (cookie, callback) = fixture.begin(None).await;
         assert_eq!(
             fixture
@@ -711,7 +726,7 @@ mod tests {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
-        *fixture.state.store.lock().await = SessionStore::new(1, 1);
+        fixture.state.store = Arc::new(obz_auth::MemorySessionStore::new(1, 1));
         let (cookie, _) = fixture.begin(None).await;
         assert_eq!(
             fixture
@@ -852,5 +867,150 @@ mod tests {
                 .unwrap()
                 .starts_with(content_type));
         }
+    }
+    fn redis_test_url() -> String {
+        std::env::var("AUTH_TEST_REDIS_URL").expect("set AUTH_TEST_REDIS_URL to a real test Redis")
+    }
+    async fn redis_store(url: String, namespace: &str) -> Arc<obz_auth::RedisSessionStore> {
+        let mut config = obz_auth::RedisStoreConfig::new(url, namespace.into());
+        config.timeout = std::time::Duration::from_millis(500);
+        Arc::new(obz_auth::RedisSessionStore::connect(config).await.unwrap())
+    }
+    async fn erase_redis_test_namespace(namespace: &str) {
+        use redis::AsyncCommands;
+        let client = redis::Client::open(redis_test_url()).unwrap();
+        let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+        let keys: Vec<String> = connection
+            .keys(format!("zb:{{{namespace}}}:*"))
+            .await
+            .unwrap();
+        if !keys.is_empty() {
+            let _: usize = connection.del(keys).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AUTH_TEST_REDIS_URL and a real Redis"]
+    async fn redis_login_crosses_instances_survives_reconstruction_and_revokes_everywhere() {
+        let namespace = format!(
+            "api-test-{}",
+            openidconnect::CsrfToken::new_random().secret()
+        );
+        let first_store = redis_store(redis_test_url(), &namespace).await;
+        let second_store = redis_store(redis_test_url(), &namespace).await;
+        let mut fixture = Fixture::new(false, 300).await;
+        fixture.state.store = first_store.clone();
+        let (login_cookie, callback) = fixture.begin(None).await;
+        // Distinct Redis connections represent independently running replicas.
+        fixture.state.store = second_store;
+        let (one, two) = tokio::join!(
+            fixture.request("GET", &callback, Some(&login_cookie), None, None),
+            fixture.request("GET", &callback, Some(&login_cookie), None, None)
+        );
+        let success = match (one.status(), two.status()) {
+            (StatusCode::SEE_OTHER, StatusCode::UNAUTHORIZED) => one,
+            (StatusCode::UNAUTHORIZED, StatusCode::SEE_OTHER) => two,
+            _ => panic!("callback must succeed exactly once"),
+        };
+        assert_eq!(fixture.provider.exchanges.load(Ordering::SeqCst), 1);
+        let session_cookie = response_cookie(&success, fixture.state.session_cookie());
+        // Recreate storage as after an API restart, keeping the same namespace.
+        fixture.state.store = redis_store(redis_test_url(), &namespace).await;
+        let response = fixture
+            .request("GET", "/api/auth/me", Some(&session_cookie), None, None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let data: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let csrf = data["csrf_token"].as_str().unwrap();
+        assert_eq!(
+            fixture
+                .request(
+                    "POST",
+                    "/api/auth/logout",
+                    Some(&session_cookie),
+                    Some(csrf),
+                    Some("http://localhost:3000")
+                )
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        fixture.state.store = first_store;
+        assert_eq!(
+            fixture
+                .request("GET", "/api/auth/me", Some(&session_cookie), None, None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        erase_redis_test_namespace(&namespace).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AUTH_TEST_REDIS_URL and a real Redis"]
+    async fn redis_transport_failure_returns_503_without_accepting_session_or_fallback() {
+        let namespace = format!(
+            "api-test-{}",
+            openidconnect::CsrfToken::new_random().secret()
+        );
+        let upstream_url = url::Url::parse(&redis_test_url()).unwrap();
+        assert_eq!(
+            upstream_url.scheme(),
+            "redis",
+            "fault injection uses a local plain Redis proxy"
+        );
+        let host = upstream_url.host_str().unwrap().to_owned();
+        let port = upstream_url.port().unwrap_or(6379);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut downstream, _) = accepted.unwrap();
+                        let host = host.clone();
+                        connections.spawn(async move {
+                            if let Ok(mut upstream) = tokio::net::TcpStream::connect((host.as_str(), port)).await {
+                                let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                            }
+                        });
+                    },
+                    Some(_) = connections.join_next() => {},
+                }
+            }
+        });
+        let mut proxy_url = upstream_url;
+        proxy_url.set_host(Some("127.0.0.1")).unwrap();
+        proxy_url.set_port(Some(address.port())).unwrap();
+        let mut fixture = Fixture::new(false, 300).await;
+        fixture.state.store = redis_store(proxy_url.to_string(), &namespace).await;
+        let (cookie, csrf) = fixture.authenticate().await;
+        proxy.abort();
+        let _ = proxy.await;
+        assert_eq!(
+            fixture
+                .request("GET", "/api/auth/me", Some(&cookie), None, None)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            fixture
+                .request("POST", "/api/auth/logout", Some(&cookie), Some(&csrf), None)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            fixture
+                .request("GET", "/api/auth/login", None, None, None)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        erase_redis_test_namespace(&namespace).await;
     }
 }
