@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: dex-postgres
+    environment:
+      POSTGRES_DB: dex
+      POSTGRES_USER: dex
+      POSTGRES_PASSWORD: dexpassword
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    networks:
+      - auth-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dex"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  dex:
+    image: dexidp/dex:v2.37.0
+    container_name: dex-server
+    ports:
+      - "5556:5556"
+    environment:
+      DEXIDP_CONFIG: /etc/dex/config.yaml
+    volumes:
+      - ./config/dex-config.yaml:/etc/dex/config.yaml
+    command: dex serve /etc/dex/config.yaml
+    networks:
+      - auth-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+networks:
+  auth-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
