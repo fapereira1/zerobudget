@@ -14,6 +14,10 @@ sha2 = "0.10"
 redis = { version = "0.32.7", default-features = false, features = ["tokio-rustls-comp", "connection-manager", "script"] }
 tokio = { version = "1", features = ["sync", "time"] }
 
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "migrate", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+url = "2"
+
 [dev-dependencies]
 chrono = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

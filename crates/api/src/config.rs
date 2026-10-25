@@ -1,6 +1,6 @@
 use obz_auth::{
-    AuthConfig, AuthError, MemorySessionStore, RedisSessionStore, RedisStoreConfig, SessionError,
-    SessionStore,
+    AuthConfig, AuthError, DatabaseConfig, IdentityError, IdentityRepository, MemorySessionStore,
+    PostgresIdentityRepository, RedisSessionStore, RedisStoreConfig, SessionError, SessionStore,
 };
 use std::{env, net::SocketAddr};
 use std::{sync::Arc, time::Duration};
@@ -16,6 +16,7 @@ pub struct Config {
     callback: String,
     local_http: bool,
     storage: StorageConfig,
+    database: DatabaseConfig,
 }
 enum StorageConfig {
     Memory {
@@ -95,6 +96,14 @@ impl Config {
             }
             _ => return Err("AUTH_SESSION_BACKEND must explicitly be redis or memory".into()),
         };
+        let mut database = DatabaseConfig::new(
+            env::var("DATABASE_URL")
+                .map_err(|_| "DATABASE_URL is required for application identities")?,
+            local_http,
+        );
+        database.timeout =
+            Duration::from_millis(positive("DATABASE_TIMEOUT_MS", 3000, 30_000)? as u64);
+        database.max_connections = positive("DATABASE_MAX_CONNECTIONS", 10, 100)? as u32;
         let config = Self {
             bind: env::var("API_BIND")
                 .unwrap_or_else(|_| "127.0.0.1:3000".into())
@@ -108,6 +117,7 @@ impl Config {
             callback: url.join("/api/auth/callback")?.to_string(),
             local_http,
             storage,
+            database,
         };
         config.auth_config()?;
         Ok(config)
@@ -129,6 +139,17 @@ impl Config {
                 Ok(Arc::new(RedisSessionStore::connect(copy).await?))
             }
         }
+    }
+    pub async fn identity_repository(&self) -> Result<Arc<dyn IdentityRepository>, IdentityError> {
+        let mut config = DatabaseConfig::new(
+            self.database.url.clone(),
+            self.database.allow_loopback_plaintext,
+        );
+        config.timeout = self.database.timeout;
+        config.max_connections = self.database.max_connections;
+        let repository = PostgresIdentityRepository::connect(config).await?;
+        repository.check_schema().await?;
+        Ok(Arc::new(repository))
     }
     pub fn auth_config(&self) -> Result<AuthConfig, AuthError> {
         AuthConfig::new(

@@ -42,7 +42,12 @@ O cliente HTTP tem timeout de dez segundos e não segue redirecionamentos.
 
 ## Autorização
 
-`Policy` nega acesso por padrão. Permissões são concedidas por configuração
+Para a API, as permissões atuais vêm de `IdentityRepository` e são aplicadas
+por `Authenticated::require`/`require_owner`. O registro local usa `(issuer, subject)`
+e não cria concessões automaticamente. Veja o [guia de persistência](../../docs/identidades-e-permissoes.md).
+
+A `Policy` abaixo é uma alternativa em memória para consumidores independentes
+do crate; não substitui a consulta ao PostgreSQL na API. `Policy` nega acesso por padrão. Permissões são concedidas por configuração
 confiável da aplicação para `(issuer, subject)`, nunca por email ou campos da
 requisição. Não há promoção automática a administrador.
 
@@ -97,7 +102,8 @@ As chaves ficam em memória durante a vida de `DexAuth`. A API recria e substitu
 atomicamente a instância a cada cinco minutos para acompanhar a rotação do Dex.
 Chaves desconhecidas são rejeitadas até a atualização. Consumidores independentes
 do crate precisam definir sua própria rotina de atualização. Ainda não há
-renovação de sessão, persistência de permissões ou logout federado.
+renovação de sessão ou logout federado. Identidades e permissões da API são
+persistidas no PostgreSQL separado do Dex, com consultas atuais por requisição.
 
 ## Limites desta etapa
 

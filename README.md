@@ -8,3 +8,5 @@ Aplicação Rust de gestão financeira pessoal com orçamento base zero.
 - [Dex para desenvolvimento local](docs/setup-dex.md)
 
 - [Entrega de sessões compartilhadas e próximos passos](docs/proximo-passo-auth.md)
+
+- [Identidades locais e permissões persistentes](docs/identidades-e-permissoes.md)

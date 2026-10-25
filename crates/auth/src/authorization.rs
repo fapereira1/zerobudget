@@ -4,10 +4,31 @@ use crate::{AuthError, Identity};
 
 /// Application permissions are assigned by trusted application configuration,
 /// never by a request body or an unverified email address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum Permission {
+    #[serde(rename = "budget:read")]
     ReadBudget,
+    #[serde(rename = "budget:write")]
     WriteBudget,
+}
+
+impl Permission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadBudget => "budget:read",
+            Self::WriteBudget => "budget:write",
+        }
+    }
+}
+impl std::str::FromStr for Permission {
+    type Err = crate::IdentityError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "budget:read" => Ok(Self::ReadBudget),
+            "budget:write" => Ok(Self::WriteBudget),
+            _ => Err(crate::IdentityError::Invalid),
+        }
+    }
 }
 
 /// Grants are scoped to the stable OIDC pair (issuer, subject).

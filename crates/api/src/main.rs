@@ -7,7 +7,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let auth = DexAuth::discover(config.auth_config()?).await?;
     let store = config.session_store().await?;
-    let state = AppState::new(auth, config.origin.clone(), config.secure_cookies, store);
+    let users = config.identity_repository().await?;
+    let state = AppState::new(
+        auth,
+        config.origin.clone(),
+        config.secure_cookies,
+        store,
+        users,
+    );
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     println!("ZeroBudget API listening on {}", listener.local_addr()?);
     let app = router(state.clone());

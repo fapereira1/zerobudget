@@ -6,7 +6,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use obz_auth::{AuthError, DexAuth, Identity, SessionError, SessionStore};
+use obz_auth::{
+    AuthError, DexAuth, Identity, IdentityError, IdentityRepository, LocalUser, Permission,
+    SessionError, SessionStore,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -15,6 +18,7 @@ use tokio::sync::RwLock;
 pub struct AppState {
     auth: Arc<RwLock<Arc<DexAuth>>>,
     store: Arc<dyn SessionStore>,
+    users: Arc<dyn IdentityRepository>,
     origin: Arc<str>,
     secure: bool,
 }
@@ -24,10 +28,12 @@ impl AppState {
         origin: String,
         secure_cookies: bool,
         store: Arc<dyn SessionStore>,
+        users: Arc<dyn IdentityRepository>,
     ) -> Self {
         Self {
             auth: Arc::new(RwLock::new(Arc::new(auth))),
             store,
+            users,
             origin: origin.into(),
             secure: secure_cookies,
         }
@@ -145,6 +151,26 @@ impl From<SessionError> for ApiError {
         }
     }
 }
+impl From<IdentityError> for ApiError {
+    fn from(error: IdentityError) -> Self {
+        match error {
+            IdentityError::Unavailable => Self(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application identity storage unavailable",
+            ),
+            IdentityError::Configuration => Self(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "application identity configuration error",
+            ),
+            IdentityError::NotFound | IdentityError::Invalid => {
+                Self(StatusCode::UNAUTHORIZED, "sign in again")
+            }
+            IdentityError::Disabled => Self(StatusCode::FORBIDDEN, "user account disabled"),
+            IdentityError::Forbidden => Self(StatusCode::FORBIDDEN, "permission denied"),
+        }
+    }
+}
+
 impl From<AuthError> for ApiError {
     fn from(error: AuthError) -> Self {
         match error {
@@ -249,6 +275,7 @@ async fn finish_callback(
     let previous = cookie(headers, state.session_cookie())?;
     let auth = state.auth.read().await.clone();
     let identity = auth.finish_login(attempt, &returned_state, code).await?;
+    state.users.register_login(&identity).await?;
     let (session, max_age) = state
         .store
         .authenticate(identity, previous.as_deref())
@@ -262,8 +289,19 @@ async fn finish_callback(
 /// Financial handlers must additionally check application permissions and ownership.
 pub struct Authenticated {
     pub identity: Identity,
+    pub user: LocalUser,
     csrf: String,
     expires_at: u64,
+}
+impl Authenticated {
+    pub fn require(&self, permission: Permission) -> Result<(), ApiError> {
+        self.user.require(permission).map_err(Into::into)
+    }
+    pub fn require_owner(&self, permission: Permission, owner: uuid::Uuid) -> Result<(), ApiError> {
+        self.user
+            .require_owner(permission, owner)
+            .map_err(Into::into)
+    }
 }
 impl FromRequestParts<AppState> for Authenticated {
     type Rejection = ApiError;
@@ -280,8 +318,10 @@ impl FromRequestParts<AppState> for Authenticated {
             verify_origin(&parts.headers, state)?;
             session.verify_csrf(csrf_header(&parts.headers)?)?;
         }
+        let user = state.users.find(session.identity()).await?;
         Ok(Self {
             identity: session.identity().clone(),
+            user,
             csrf: session.csrf_token().to_owned(),
             expires_at: session.expires_at(),
         })
@@ -289,6 +329,8 @@ impl FromRequestParts<AppState> for Authenticated {
 }
 #[derive(Serialize)]
 struct Me {
+    user_id: String,
+    permissions: Vec<Permission>,
     issuer: String,
     subject: String,
     expires_at: u64,
@@ -296,6 +338,8 @@ struct Me {
 }
 async fn me(authenticated: Authenticated) -> Json<Me> {
     Json(Me {
+        user_id: authenticated.user.id().to_string(),
+        permissions: authenticated.user.permissions().iter().copied().collect(),
         issuer: authenticated.identity.issuer().into(),
         subject: authenticated.identity.subject().into(),
         expires_at: authenticated.expires_at,
@@ -330,6 +374,10 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
     state.set_cookie(&mut response, state.session_cookie(), "", 0);
     Ok(response)
 }
+
+#[cfg(test)]
+#[path = "../../auth/tests/support/postgres.rs"]
+mod postgres_support;
 
 #[cfg(test)]
 mod tests {
@@ -477,6 +525,7 @@ mod tests {
                 "http://localhost:3000".into(),
                 secure,
                 Arc::new(obz_auth::MemorySessionStore::default()),
+                Arc::new(obz_auth::MemoryIdentityRepository::default()),
             );
             Self {
                 state,
@@ -1012,5 +1061,240 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         erase_redis_test_namespace(&namespace).await;
+    }
+    async fn protected_read(fixture: &Fixture, cookie: &str) -> Response {
+        let app = Router::new()
+            .route(
+                "/budget",
+                get(|authenticated: Authenticated| async move {
+                    authenticated.require(Permission::ReadBudget)?;
+                    Ok::<_, ApiError>(StatusCode::NO_CONTENT)
+                }),
+            )
+            .with_state(fixture.state.clone());
+        app.oneshot(
+            axum::http::Request::builder()
+                .uri("/budget")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+    async fn me_data(fixture: &Fixture, cookie: &str) -> Value {
+        let response = fixture
+            .request("GET", "/api/auth/me", Some(cookie), None, None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+    #[tokio::test]
+    async fn current_permissions_and_disabled_state_apply_to_existing_session() {
+        let mut fixture = Fixture::new(false, 300).await;
+        let users = Arc::new(obz_auth::MemoryIdentityRepository::default());
+        fixture.state.users = users.clone();
+        let (cookie, csrf) = fixture.authenticate().await;
+        let data = me_data(&fixture, &cookie).await;
+        let user_id: uuid::Uuid = data["user_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(data["permissions"], serde_json::json!([]));
+        assert_eq!(
+            protected_read(&fixture, &cookie).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        users.grant(user_id, Permission::ReadBudget).await.unwrap();
+        assert_eq!(
+            protected_read(&fixture, &cookie).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            me_data(&fixture, &cookie).await["permissions"],
+            serde_json::json!(["budget:read"])
+        );
+        users.revoke(user_id, Permission::ReadBudget).await.unwrap();
+        assert_eq!(
+            protected_read(&fixture, &cookie).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        users.set_enabled(user_id, false).await.unwrap();
+        assert_eq!(
+            fixture
+                .request("GET", "/api/auth/me", Some(&cookie), None, None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let (login_cookie, callback) = fixture.begin(None).await;
+        assert_eq!(
+            fixture
+                .request("GET", &callback, Some(&login_cookie), None, None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        // Session revocation remains available even for disabled accounts.
+        assert_eq!(
+            fixture
+                .request("POST", "/api/auth/logout", Some(&cookie), Some(&csrf), None)
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AUTH_TEST_DATABASE_URL and AUTH_TEST_RUNTIME_DATABASE_URL"]
+    async fn postgres_permissions_revoke_and_block_an_existing_browser_session() {
+        let database = super::postgres_support::TestDatabase::create().await;
+        let owner = obz_auth::PostgresIdentityRepository::connect(obz_auth::DatabaseConfig::new(
+            database.owner_url.clone(),
+            true,
+        ))
+        .await
+        .unwrap();
+        owner.migrate().await.unwrap();
+        owner
+            .grant_runtime_role(&database.runtime_role)
+            .await
+            .unwrap();
+        let runtime = Arc::new(
+            obz_auth::PostgresIdentityRepository::connect(obz_auth::DatabaseConfig::new(
+                database.runtime_url.clone(),
+                true,
+            ))
+            .await
+            .unwrap(),
+        );
+        let mut fixture = Fixture::new(false, 300).await;
+        fixture.state.users = runtime;
+        let (cookie, csrf) = fixture.authenticate().await;
+        let data = me_data(&fixture, &cookie).await;
+        let user_id: uuid::Uuid = data["user_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            protected_read(&fixture, &cookie).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        owner.grant(user_id, Permission::ReadBudget).await.unwrap();
+        assert_eq!(
+            protected_read(&fixture, &cookie).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        // A distinct repository/pool gets the same ID and current permissions.
+        fixture.state.users = Arc::new(
+            obz_auth::PostgresIdentityRepository::connect(obz_auth::DatabaseConfig::new(
+                database.runtime_url.clone(),
+                true,
+            ))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(me_data(&fixture, &cookie).await["user_id"], data["user_id"]);
+        owner.revoke(user_id, Permission::ReadBudget).await.unwrap();
+        assert_eq!(
+            protected_read(&fixture, &cookie).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        owner.set_enabled(user_id, false).await.unwrap();
+        assert_eq!(
+            fixture
+                .request("GET", "/api/auth/me", Some(&cookie), None, None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let (pending, callback) = fixture.begin(None).await;
+        assert_eq!(
+            fixture
+                .request("GET", &callback, Some(&pending), None, None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            fixture
+                .request("POST", "/api/auth/logout", Some(&cookie), Some(&csrf), None)
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AUTH_TEST_DATABASE_URL and AUTH_TEST_RUNTIME_DATABASE_URL"]
+    async fn postgres_transport_failure_returns_503_while_logout_still_revokes() {
+        let database = super::postgres_support::TestDatabase::create().await;
+        let owner = obz_auth::PostgresIdentityRepository::connect(obz_auth::DatabaseConfig::new(
+            database.owner_url.clone(),
+            true,
+        ))
+        .await
+        .unwrap();
+        owner.migrate().await.unwrap();
+        owner
+            .grant_runtime_role(&database.runtime_role)
+            .await
+            .unwrap();
+        let mut url = url::Url::parse(&database.runtime_url).unwrap();
+        let host = url.host_str().unwrap().to_owned();
+        let port = url.port().unwrap_or(5432);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut downstream, _) = accepted.unwrap();
+                        let host = host.clone();
+                        connections.spawn(async move {
+                            if let Ok(mut upstream) = tokio::net::TcpStream::connect((host.as_str(), port)).await {
+                                let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                            }
+                        });
+                    },
+                    Some(_) = connections.join_next() => {},
+                }
+            }
+        });
+        url.set_host(Some("127.0.0.1")).unwrap();
+        url.set_port(Some(address.port())).unwrap();
+        let mut config = obz_auth::DatabaseConfig::new(url.to_string(), true);
+        config.timeout = std::time::Duration::from_millis(300);
+        let repository = obz_auth::PostgresIdentityRepository::connect(config)
+            .await
+            .unwrap();
+        let mut fixture = Fixture::new(false, 300).await;
+        fixture.state.users = Arc::new(repository);
+        let (cookie, csrf) = fixture.authenticate().await;
+        proxy.abort();
+        let _ = proxy.await;
+        assert_eq!(
+            fixture
+                .request("GET", "/api/auth/me", Some(&cookie), None, None)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            protected_read(&fixture, &cookie).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let (pending, callback) = fixture.begin(None).await;
+        assert_eq!(
+            fixture
+                .request("GET", &callback, Some(&pending), None, None)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            fixture
+                .request("POST", "/api/auth/logout", Some(&cookie), Some(&csrf), None)
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        database.destroy().await;
     }
 }

@@ -16,6 +16,25 @@ services:
       timeout: 5s
       retries: 5
 
+  app-postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: zerobudget
+      POSTGRES_USER: zerobudget_admin
+      POSTGRES_PASSWORD: app-admin-dev-password
+    ports:
+      - "127.0.0.1:${APP_POSTGRES_PORT:-5440}:5432"
+    volumes:
+      - app_postgres_data:/var/lib/postgresql
+      - ./config/app-postgres-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - auth-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zerobudget_admin -d zerobudget"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   redis:
     image: redis:8-alpine
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
@@ -54,3 +73,4 @@ networks:
 volumes:
   postgres_data:
   auth_redis_data:
+  app_postgres_data:

@@ -10,6 +10,13 @@ Na raiz do workspace:
 
 ```bash
 docker compose up -d
+
+# Execute uma vez antes de iniciar a API; credenciais apenas neste processo.
+AUTH_ALLOW_LOCAL_HTTP=true \
+DATABASE_ADMIN_URL=postgres://zerobudget_admin:app-admin-dev-password@127.0.0.1:5440/zerobudget \
+DATABASE_RUNTIME_ROLE=zerobudget_runtime \
+cargo run -p obz-auth --example auth_admin -- migrate
+
 set -a
 . ./.env.example
 set +a
@@ -19,7 +26,8 @@ cargo run -p obz-api
 Abra **http://localhost:3000/api/auth/login** no navegador e entre com
 `admin` / `password`. Após autorizar no Dex, a API recebe o callback e
 redireciona para `/auth/session`, uma página HTML com a identidade e o botão Sair.
-O endpoint `/api/auth/me` continua retornando identidade e token CSRF em JSON.
+O endpoint `/api/auth/me` retorna identidade, UUID local (`user_id`), permissões
+atuais e token CSRF em JSON. O primeiro login não concede permissões financeiras.
 Não é mais necessário copiar URLs para o terminal.
 
 Use `localhost` durante todo o fluxo. Alternar para `127.0.0.1` muda o host do
@@ -62,6 +70,9 @@ provedor upstream. Um novo login pode aproveitar o SSO existente no Dex.
 | `AUTH_REDIS_TIMEOUT_MS` | `3000` | Timeout de conexão e operações; intervalo permitido: 1 a 30000 ms |
 | `AUTH_MAX_PENDING` | `1024` | Capacidade de tentativas compartilhada pelo namespace |
 | `AUTH_MAX_SESSIONS` | `4096` | Capacidade de sessões compartilhada pelo namespace |
+| `DATABASE_URL` | obrigatório | Banco da aplicação com papel de runtime restrito |
+| `DATABASE_TIMEOUT_MS` | `3000` | Timeout por operação PostgreSQL, até 30000 ms |
+| `DATABASE_MAX_CONNECTIONS` | `10` | Limite de conexões PostgreSQL por instância, até 100 |
 
 A aplicação lê variáveis do ambiente; não carrega `.env` automaticamente.
 O exemplo acima exporta apenas a configuração local de `.env.example`; em
@@ -76,7 +87,8 @@ Terminação TLS pode ocorrer no proxy; a origem pública configurada determina
 
 - Cookies são host-only, `HttpOnly`, `SameSite=Lax`, com `Path=/`. Em HTTPS,
   recebem `Secure` e nomes com prefixo `__Host-`.
-- `state`, `nonce` e o verificador PKCE permanecem na memória do servidor.
+- `state`, `nonce` e o verificador PKCE permanecem somente no backend do servidor
+  (Redis ou memória), sem serem expostos ao navegador.
   A tentativa é selecionada pelo cookie do navegador, removida atomicamente
   antes da troca do código e invalidada mesmo em callbacks recusados ou malformados.
 - As chaves Redis usam SHA-256 dos IDs opacos; os payloads são internos e
@@ -89,8 +101,12 @@ Terminação TLS pode ocorrer no proxy; a origem pública configurada determina
 - `Authenticated` protege handlers com uma identidade validada. Para métodos
   que alteram dados, exige CSRF; quando `Origin` é enviado, exige a origem pública
   configurada. Logout aplica as mesmas verificações. CORS não está habilitado.
+- A identidade local e as permissões ficam no PostgreSQL da aplicação, separado
+  do Dex. Cada requisição protegida consulta o estado atual, aplicando bloqueios
+  e revogações mesmo com uma sessão Redis válida.
 - Permissões financeiras continuam negadas por padrão. Novos handlers devem
-  usar `Policy` e conferir propriedade a partir do banco, além do extractor.
+  usar `Authenticated::require` ou `require_owner` e conferir propriedade a
+  partir do banco, além do extractor.
   O login não concede permissões financeiras automaticamente.
 - Respostas usam `Cache-Control: no-store`, `Referrer-Policy: no-referrer` e
   `X-Content-Type-Options: nosniff`. Tokens, cookies e URLs de callback não são logados.
@@ -156,6 +172,8 @@ cargo clippy -p obz-api -p obz-auth --all-targets -- -D warnings
 
 # Inclui os testes de integração com Redis real:
 docker compose up -d redis
+AUTH_TEST_DATABASE_URL=postgres://zerobudget_admin:app-admin-dev-password@127.0.0.1:5440/zerobudget \
+AUTH_TEST_RUNTIME_DATABASE_URL=postgres://zerobudget_runtime:runtime-dev-password@127.0.0.1:5440/zerobudget \
 AUTH_TEST_REDIS_URL=redis://127.0.0.1:6380/0 \
 cargo test -p obz-api -p obz-auth -- --include-ignored
 ```
@@ -174,3 +192,13 @@ transporte injetada por um proxy local, sem interromper o Redis compartilhado.
 Referências: [Axum](https://docs.rs/axum/0.8.9/axum/),
 [OWASP: sessões](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html),
 [OWASP: CSRF](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html).
+
+## Identidades e administração
+
+Consulte o [guia de identidades e permissões](../../docs/identidades-e-permissoes.md)
+para migrações, papéis do banco, CLI de concessão/revogação, auditoria e critérios
+de validação. O PostgreSQL dedicado da aplicação é publicado em loopback na porta
+5440 por padrão. Schema e privilégios devem ser preparados por um operador; a API
+não migra o banco nem usa a credencial administrativa. Depois de preparado, a
+indisponibilidade do banco retorna 503 nas rotas protegidas, sem fallback para
+memória. Logout continua disponível com sessão/CSRF válidos, sem depender do banco.

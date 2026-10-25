@@ -10,7 +10,7 @@
   function clearIdentity() {
     csrfToken = null;
     identity.hidden = true;
-    for (const id of ['issuer', 'subject', 'expires']) {
+    for (const id of ['issuer', 'subject', 'expires', 'user-id', 'permissions']) {
       document.getElementById(id).textContent = '';
     }
     login.hidden = false;
@@ -30,6 +30,8 @@
       throw new Error('A resposta não contém a proteção necessária para sair.');
     }
     csrfToken = data.csrf_token;
+    document.getElementById('user-id').textContent = data.user_id;
+    document.getElementById('permissions').textContent = data.permissions.length ? data.permissions.join(', ') : 'Nenhuma permissão financeira concedida';
     document.getElementById('issuer').textContent = data.issuer;
     document.getElementById('subject').textContent = data.subject;
     document.getElementById('expires').textContent = new Date(data.expires_at * 1000).toLocaleString('pt-BR');
