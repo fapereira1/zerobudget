@@ -10,3 +10,5 @@ Aplicação Rust de gestão financeira pessoal com orçamento base zero.
 - [Entrega de sessões compartilhadas e próximos passos](docs/proximo-passo-auth.md)
 
 - [Identidades locais e permissões persistentes](docs/identidades-e-permissoes.md)
+
+Ciclos de orçamento: [contrato, migração e testes](docs/ciclos-planejados.md).

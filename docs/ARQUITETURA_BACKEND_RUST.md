@@ -6,6 +6,12 @@
 
 ---
 
+> Atualização da implementação: o crate `shared` foi removido. Conexão PostgreSQL,
+> migrações e os adaptadores `PostgresIdentityRepository` e `PostgresCycleRepository`
+> ficam em `infrastructure`. `auth` e `cycle` definem contratos sem depender de SQLx;
+> `api` compõe os adaptadores. Os exemplos de arquitetura abaixo são o desenho
+> original e não uma descrição integral do estado implementado.
+
 ## 1. Visão Geral da Arquitetura
 
 ```

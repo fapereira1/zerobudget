@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+obz-infrastructure = { path = "../infrastructure" }
+obz-cycle = { path = "../cycle" }
+chrono = { version = "0.4", features = ["serde"] }
 obz-auth = { path = "../auth" }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
@@ -12,10 +15,10 @@ url = "2"
 uuid = "1"
 
 [dev-dependencies]
+async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 serde_json = "1"
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
-chrono = "0.4"
 redis = { version = "0.32.7", default-features = false, features = ["tokio-rustls-comp", "connection-manager"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid"] }

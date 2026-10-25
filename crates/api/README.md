@@ -15,7 +15,7 @@ docker compose up -d
 AUTH_ALLOW_LOCAL_HTTP=true \
 DATABASE_ADMIN_URL=postgres://zerobudget_admin:app-admin-dev-password@127.0.0.1:5440/zerobudget \
 DATABASE_RUNTIME_ROLE=zerobudget_runtime \
-cargo run -p obz-auth --example auth_admin -- migrate
+cargo run -p obz-infrastructure --example auth_admin -- migrate
 
 set -a
 . ./.env.example

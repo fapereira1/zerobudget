@@ -29,6 +29,13 @@ pub struct LocalUser {
     pub(crate) permissions: BTreeSet<Permission>,
 }
 impl LocalUser {
+    /// Reconstitute an account from trusted repository data, never request input.
+    /// IdentityRepository implementations must validate the identity, account status
+    /// and current grants before returning this value.
+    pub fn from_persisted(id: Uuid, permissions: BTreeSet<Permission>) -> Self {
+        Self { id, permissions }
+    }
+
     pub fn id(&self) -> Uuid {
         self.id
     }

@@ -1,7 +1,8 @@
 use obz_auth::{
-    AuthConfig, AuthError, DatabaseConfig, IdentityError, IdentityRepository, MemorySessionStore,
-    PostgresIdentityRepository, RedisSessionStore, RedisStoreConfig, SessionError, SessionStore,
+    AuthConfig, AuthError, IdentityError, IdentityRepository, MemorySessionStore,
+    RedisSessionStore, RedisStoreConfig, SessionError, SessionStore,
 };
+use obz_infrastructure::{DatabaseConfig, PostgresIdentityRepository};
 use std::{env, net::SocketAddr};
 use std::{sync::Arc, time::Duration};
 use url::Url;
@@ -139,6 +140,11 @@ impl Config {
                 Ok(Arc::new(RedisSessionStore::connect(copy).await?))
             }
         }
+    }
+    pub async fn database(
+        &self,
+    ) -> Result<obz_infrastructure::Database, obz_infrastructure::DatabaseError> {
+        obz_infrastructure::Database::connect(self.database.clone()).await
     }
     pub async fn identity_repository(&self) -> Result<Arc<dyn IdentityRepository>, IdentityError> {
         let mut config = DatabaseConfig::new(

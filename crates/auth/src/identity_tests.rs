@@ -1,7 +1,4 @@
-use crate::{
-    Identity, IdentityError, IdentityRepository, MemoryIdentityRepository, Permission,
-    PostgresIdentityRepository,
-};
+use crate::{Identity, IdentityError, IdentityRepository, MemoryIdentityRepository, Permission};
 use async_trait::async_trait;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -14,18 +11,6 @@ pub(crate) trait Admin: Send + Sync {
 }
 #[async_trait]
 impl Admin for MemoryIdentityRepository {
-    async fn grant(&self, user: Uuid, permission: Permission) -> Result<(), IdentityError> {
-        self.grant(user, permission).await
-    }
-    async fn revoke(&self, user: Uuid, permission: Permission) -> Result<(), IdentityError> {
-        self.revoke(user, permission).await
-    }
-    async fn enabled(&self, user: Uuid, enabled: bool) -> Result<(), IdentityError> {
-        self.set_enabled(user, enabled).await
-    }
-}
-#[async_trait]
-impl Admin for PostgresIdentityRepository {
     async fn grant(&self, user: Uuid, permission: Permission) -> Result<(), IdentityError> {
         self.grant(user, permission).await
     }

@@ -1,5 +1,6 @@
 //! Trusted operator CLI. Use a database owner/operator URL, never expose over HTTP.
-use obz_auth::{DatabaseConfig, Permission, PostgresIdentityRepository};
+use obz_auth::Permission;
+use obz_infrastructure::{DatabaseConfig, PostgresIdentityRepository};
 use uuid::Uuid;
 
 #[tokio::main]

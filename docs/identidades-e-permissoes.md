@@ -45,7 +45,7 @@ O serviço `app-postgres` do Compose usa banco `zerobudget`, volume próprio e p
 local `127.0.0.1:5440`. O PostgreSQL do Dex permanece separado, com seu banco e
 volume anteriores. `APP_POSTGRES_PORT` altera a porta publicada; ajuste as URLs.
 
-A migração `crates/auth/migrations/0001_identity_and_permissions.sql` cria:
+A migração `migrations/0001_identity_and_permissions.sql` cria:
 
 - `auth.users`: UUID, issuer, subject, habilitação e datas de criação/último login.
 - `auth.permissions`: permissões explícitas por UUID de usuário, com chave única.
@@ -78,7 +78,7 @@ docker compose up -d
 AUTH_ALLOW_LOCAL_HTTP=true \
 DATABASE_ADMIN_URL=postgres://zerobudget_admin:app-admin-dev-password@127.0.0.1:5440/zerobudget \
 DATABASE_RUNTIME_ROLE=zerobudget_runtime \
-cargo run -p obz-auth --example auth_admin -- migrate
+cargo run -p obz-infrastructure --example auth_admin -- migrate
 
 # Processo da API: .env.example contém apenas credenciais de runtime ativas.
 set -a
@@ -108,7 +108,7 @@ operador e com `DATABASE_ADMIN_URL` nesse processo, nunca no ambiente da API:
 ```bash
 AUTH_ALLOW_LOCAL_HTTP=true \
 DATABASE_ADMIN_URL=postgres://zerobudget_admin:app-admin-dev-password@127.0.0.1:5440/zerobudget \
-cargo run -p obz-auth --example auth_admin -- grant USER_UUID budget:read
+cargo run -p obz-infrastructure --example auth_admin -- grant USER_UUID budget:read
 ```
 
 As demais operações usam o mesmo prefixo de ambiente:
@@ -196,3 +196,14 @@ Implementar a primeira operação financeira com o UUID local como proprietário
 permissão explícita e filtragem no repositório. Revogação global e irreversível de
 sessões de uma conta (inclusive após desbloqueio) requer um mecanismo adicional,
 como uma geração de sessão por usuário; não está incluída nesta fase.
+
+## Localização da infraestrutura
+
+`PostgresIdentityRepository`, `PostgresCycleRepository`, `Database`,
+`DatabaseConfig` e o executor de migrações pertencem a `obz-infrastructure`.
+O antigo crate `shared` foi removido. Os contratos de identidade permanecem em
+`obz-auth`; os casos de uso e o contrato de ciclos permanecem em `obz-cycle`.
+A API faz a composição das dependências. A CLI administrativa agora é executada
+com `cargo run -p obz-infrastructure --example auth_admin -- ...`.
+O comando de migração completa continua em `obz-api --example migrate`.
+A mudança não altera o conteúdo nem o histórico das migrações existentes.

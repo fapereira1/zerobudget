@@ -133,3 +133,11 @@ precisa de validação de integração.
 Referências: [Dex OIDC](https://dexidp.io/docs/openid-connect/),
 [fluxos do Dex](https://dexidp.io/docs/configuration/oauth2/),
 [biblioteca openidconnect](https://docs.rs/openidconnect/4.0.1/openidconnect/).
+
+
+O contrato `IdentityRepository` pertence a este crate. Sua implementação PostgreSQL,
+`PostgresIdentityRepository`, e a CLI `auth_admin` pertencem a `obz-infrastructure`.
+Este crate não depende de SQLx. Implementadores externos reconstituem `LocalUser`
+com `from_persisted` somente após validar a identidade, o estado da conta e suas
+permissões atuais; `Identity::validate_current` verifica a validade temporal sem
+permitir a construção de identidades fora do fluxo OIDC verificado.

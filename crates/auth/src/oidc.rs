@@ -87,6 +87,11 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Check that this verified identity is still valid for local account lookup.
+    pub fn validate_current(&self) -> Result<(), crate::IdentityError> {
+        crate::identity::validate_identity(self)
+    }
+
     pub fn issuer(&self) -> &str {
         &self.issuer
     }

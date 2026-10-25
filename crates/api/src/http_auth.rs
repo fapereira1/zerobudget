@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub(crate) cycles: Option<obz_cycle::CycleService>,
     auth: Arc<RwLock<Arc<DexAuth>>>,
     store: Arc<dyn SessionStore>,
     users: Arc<dyn IdentityRepository>,
@@ -31,12 +32,17 @@ impl AppState {
         users: Arc<dyn IdentityRepository>,
     ) -> Self {
         Self {
+            cycles: None,
             auth: Arc::new(RwLock::new(Arc::new(auth))),
             store,
             users,
             origin: origin.into(),
             secure: secure_cookies,
         }
+    }
+    pub fn with_cycles(mut self, cycles: obz_cycle::CycleService) -> Self {
+        self.cycles = Some(cycles);
+        self
     }
     pub async fn replace_auth(&self, auth: DexAuth) {
         *self.auth.write().await = Arc::new(auth);
@@ -80,6 +86,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/callback", get(callback))
         .route("/api/auth/me", get(me))
         .route("/api/auth/logout", post(logout))
+        .merge(crate::http_cycles::routes())
         .with_state(state)
         .layer(middleware::from_fn(security_headers))
 }
@@ -121,7 +128,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-pub struct ApiError(StatusCode, &'static str);
+pub struct ApiError(pub(crate) StatusCode, pub(crate) &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         #[derive(Serialize)]
@@ -1146,10 +1153,9 @@ mod tests {
     #[ignore = "requires AUTH_TEST_DATABASE_URL and AUTH_TEST_RUNTIME_DATABASE_URL"]
     async fn postgres_permissions_revoke_and_block_an_existing_browser_session() {
         let database = super::postgres_support::TestDatabase::create().await;
-        let owner = obz_auth::PostgresIdentityRepository::connect(obz_auth::DatabaseConfig::new(
-            database.owner_url.clone(),
-            true,
-        ))
+        let owner = obz_infrastructure::PostgresIdentityRepository::connect(
+            obz_infrastructure::DatabaseConfig::new(database.owner_url.clone(), true),
+        )
         .await
         .unwrap();
         owner.migrate().await.unwrap();
@@ -1158,10 +1164,9 @@ mod tests {
             .await
             .unwrap();
         let runtime = Arc::new(
-            obz_auth::PostgresIdentityRepository::connect(obz_auth::DatabaseConfig::new(
-                database.runtime_url.clone(),
-                true,
-            ))
+            obz_infrastructure::PostgresIdentityRepository::connect(
+                obz_infrastructure::DatabaseConfig::new(database.runtime_url.clone(), true),
+            )
             .await
             .unwrap(),
         );
@@ -1181,10 +1186,9 @@ mod tests {
         );
         // A distinct repository/pool gets the same ID and current permissions.
         fixture.state.users = Arc::new(
-            obz_auth::PostgresIdentityRepository::connect(obz_auth::DatabaseConfig::new(
-                database.runtime_url.clone(),
-                true,
-            ))
+            obz_infrastructure::PostgresIdentityRepository::connect(
+                obz_infrastructure::DatabaseConfig::new(database.runtime_url.clone(), true),
+            )
             .await
             .unwrap(),
         );
@@ -1224,10 +1228,9 @@ mod tests {
     #[ignore = "requires AUTH_TEST_DATABASE_URL and AUTH_TEST_RUNTIME_DATABASE_URL"]
     async fn postgres_transport_failure_returns_503_while_logout_still_revokes() {
         let database = super::postgres_support::TestDatabase::create().await;
-        let owner = obz_auth::PostgresIdentityRepository::connect(obz_auth::DatabaseConfig::new(
-            database.owner_url.clone(),
-            true,
-        ))
+        let owner = obz_infrastructure::PostgresIdentityRepository::connect(
+            obz_infrastructure::DatabaseConfig::new(database.owner_url.clone(), true),
+        )
         .await
         .unwrap();
         owner.migrate().await.unwrap();
@@ -1259,9 +1262,9 @@ mod tests {
         });
         url.set_host(Some("127.0.0.1")).unwrap();
         url.set_port(Some(address.port())).unwrap();
-        let mut config = obz_auth::DatabaseConfig::new(url.to_string(), true);
-        config.timeout = std::time::Duration::from_millis(300);
-        let repository = obz_auth::PostgresIdentityRepository::connect(config)
+        let mut config = obz_infrastructure::DatabaseConfig::new(url.to_string(), true);
+        config.timeout = std::time::Duration::from_secs(3);
+        let repository = obz_infrastructure::PostgresIdentityRepository::connect(config)
             .await
             .unwrap();
         let mut fixture = Fixture::new(false, 300).await;
@@ -1296,5 +1299,290 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         database.destroy().await;
+    }
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL databases"]
+    async fn cycles_http_and_database_enforce_owner_and_current_permissions() {
+        let db = super::postgres_support::TestDatabase::create().await;
+        let owner_db = obz_infrastructure::Database::connect(
+            obz_infrastructure::DatabaseConfig::new(db.owner_url.clone(), true),
+        )
+        .await
+        .unwrap();
+        owner_db.migrate().await.unwrap();
+        let owner = obz_infrastructure::PostgresIdentityRepository::from_database(&owner_db);
+        owner.grant_runtime_role(&db.runtime_role).await.unwrap();
+        obz_infrastructure::PostgresCycleRepository::new(owner_db.clone())
+            .grant_runtime_role(&db.runtime_role)
+            .await
+            .unwrap();
+        let mut config = obz_infrastructure::DatabaseConfig::new(db.runtime_url.clone(), true);
+        config.max_connections = 1;
+        let runtime = obz_infrastructure::Database::connect(config).await.unwrap();
+        let mut fixture = Fixture::new(false, 300).await;
+        fixture.state.users =
+            Arc::new(obz_infrastructure::PostgresIdentityRepository::from_database(&runtime));
+        fixture.state.cycles = Some(obz_cycle::CycleService::new(Arc::new(
+            obz_infrastructure::PostgresCycleRepository::new(runtime.clone()),
+        )));
+        let (cookie, csrf) = fixture.authenticate().await;
+        let user: uuid::Uuid = me_data(&fixture, &cookie).await["user_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let body =
+            r#"{"period_start":"2026-10-01","period_end":"2026-11-01","income_cents":10000}"#;
+        async fn create(f: &Fixture, cookie: &str, csrf: Option<&str>, body: &str) -> Response {
+            let mut req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/cycles")
+                .header("cookie", cookie)
+                .header("content-type", "application/json");
+            if let Some(csrf) = csrf {
+                req = req.header("x-csrf-token", csrf);
+            }
+            router(f.state.clone())
+                .oneshot(req.body(Body::from(body.to_owned())).unwrap())
+                .await
+                .unwrap()
+        }
+        assert_eq!(
+            fixture
+                .request("GET", "/api/cycles", None, None, None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            create(&fixture, &cookie, Some(&csrf), body).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        owner.grant(user, Permission::WriteBudget).await.unwrap();
+        assert_eq!(
+            create(&fixture, &cookie, None, body).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let response = create(&fixture, &cookie, Some(&csrf), body).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let id = value["id"].as_str().unwrap();
+        assert_eq!(value["available_cents"], 10000);
+        assert_eq!(
+            create(&fixture, &cookie, Some(&csrf), body).await.status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            fixture
+                .request("GET", "/api/cycles", Some(&cookie), None, None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        owner.grant(user, Permission::ReadBudget).await.unwrap();
+        assert_eq!(
+            fixture
+                .request(
+                    "GET",
+                    &format!("/api/cycles/{id}"),
+                    Some(&cookie),
+                    None,
+                    None
+                )
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        for invalid in [
+            body.replace("10000", "-1"),
+            body.replace("2026-11-01", "2026-09-01"),
+            body.replace("10000", "1.5"),
+            body.replace("10000}", "10000,\"owner_id\":\"spoof\"}"),
+        ] {
+            assert_eq!(
+                create(&fixture, &cookie, Some(&csrf), &invalid)
+                    .await
+                    .status(),
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        assert_eq!(
+            create(&fixture, &cookie, Some(&csrf), &" ".repeat(5000))
+                .await
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let other = uuid::Uuid::new_v4();
+        let foreign = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO auth.users(id,issuer,subject) VALUES($1,'https://other.example','other')",
+        )
+        .bind(other)
+        .execute(owner_db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO budgeting.cycles(id,owner_id,period_start,period_end,income_cents) VALUES($1,$2,'2026-01-01','2026-02-01',123)").bind(foreign).bind(other).execute(owner_db.pool()).await.unwrap();
+        assert_eq!(
+            fixture
+                .request(
+                    "GET",
+                    &format!("/api/cycles/{foreign}"),
+                    Some(&cookie),
+                    None,
+                    None
+                )
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM budgeting.cycles")
+            .fetch_one(runtime.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "transaction identity must not leak into reused connections"
+        );
+        for statement in [
+            "UPDATE budgeting.cycles SET income_cents=0",
+            "DELETE FROM budgeting.cycles",
+        ] {
+            assert!(sqlx::query(statement)
+                .execute(runtime.pool())
+                .await
+                .is_err());
+        }
+        let mut tx = runtime.pool().begin().await.unwrap();
+        sqlx::query("SELECT set_config('zerobudget.user_id',$1,true)")
+            .bind(user.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM budgeting.cycles")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            visible, 1,
+            "RLS must hide the foreign cycle even without an application owner filter"
+        );
+        assert!(sqlx::query("INSERT INTO budgeting.cycles(id,owner_id,period_start,period_end,income_cents) VALUES($1,$2,'2027-01-01','2027-02-01',1)").bind(uuid::Uuid::new_v4()).bind(other).execute(&mut *tx).await.is_err());
+        tx.rollback().await.unwrap();
+        owner.revoke(user, Permission::ReadBudget).await.unwrap();
+        assert_eq!(
+            fixture
+                .request("GET", "/api/cycles", Some(&cookie), None, None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        owner.revoke(user, Permission::WriteBudget).await.unwrap();
+        assert_eq!(
+            create(&fixture, &cookie, Some(&csrf), body).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        db.destroy().await;
+    }
+    #[tokio::test]
+    async fn cycle_use_cases_validate_before_persistence_and_scope_the_owner() {
+        use obz_cycle::{BudgetCycle, CycleError, CycleRepository, CycleService};
+        #[derive(Default)]
+        struct FakeRepository(std::sync::Mutex<Vec<uuid::Uuid>>);
+        #[async_trait::async_trait]
+        impl CycleRepository for FakeRepository {
+            async fn insert(
+                &self,
+                owner: uuid::Uuid,
+                cycle: BudgetCycle,
+            ) -> Result<BudgetCycle, CycleError> {
+                self.0.lock().unwrap().push(owner);
+                Ok(cycle)
+            }
+            async fn read(
+                &self,
+                owner: uuid::Uuid,
+                _: Option<uuid::Uuid>,
+                _: u32,
+                _: u32,
+            ) -> Result<Vec<BudgetCycle>, CycleError> {
+                self.0.lock().unwrap().push(owner);
+                Ok(Vec::new())
+            }
+        }
+        let mut fixture = Fixture::new(false, 300).await;
+        let users = Arc::new(obz_auth::MemoryIdentityRepository::default());
+        fixture.state.users = users.clone();
+        let (cookie, _) = fixture.authenticate().await;
+        let id: uuid::Uuid = me_data(&fixture, &cookie).await["user_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        async fn actor(f: &Fixture, cookie: &str) -> LocalUser {
+            let (mut parts, _) = axum::http::Request::builder()
+                .uri("/api/cycles")
+                .header("cookie", cookie)
+                .body(())
+                .unwrap()
+                .into_parts();
+            Authenticated::from_request_parts(&mut parts, &f.state)
+                .await
+                .ok()
+                .unwrap()
+                .user
+        }
+        let fake = Arc::new(FakeRepository::default());
+        let service = CycleService::new(fake.clone());
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let denied = actor(&fixture, &cookie).await;
+        assert!(matches!(
+            service.create(&denied, start, end, 100).await,
+            Err(CycleError::Forbidden)
+        ));
+        assert!(matches!(
+            service.list(&denied, 20, 0).await,
+            Err(CycleError::Forbidden)
+        ));
+        assert!(matches!(
+            service.get(&denied, uuid::Uuid::new_v4()).await,
+            Err(CycleError::Forbidden)
+        ));
+        assert!(fake.0.lock().unwrap().is_empty());
+        users.grant(id, Permission::ReadBudget).await.unwrap();
+        users.grant(id, Permission::WriteBudget).await.unwrap();
+        let allowed = actor(&fixture, &cookie).await;
+        assert!(matches!(
+            service.create(&allowed, start, end, -1).await,
+            Err(CycleError::Invalid)
+        ));
+        assert!(matches!(
+            service.create(&allowed, end, start, 100).await,
+            Err(CycleError::Invalid)
+        ));
+        assert!(matches!(
+            service.list(&allowed, 101, 0).await,
+            Err(CycleError::Invalid)
+        ));
+        assert!(fake.0.lock().unwrap().is_empty());
+        assert_eq!(
+            service
+                .create(&allowed, start, end, 100)
+                .await
+                .unwrap()
+                .income_cents,
+            100
+        );
+        assert!(service.list(&allowed, 20, 0).await.unwrap().is_empty());
+        assert!(matches!(
+            service.get(&allowed, uuid::Uuid::new_v4()).await,
+            Err(CycleError::NotFound)
+        ));
+        assert_eq!(*fake.0.lock().unwrap(), vec![id, id, id]);
+    }
+    mod postgres_identity_tests {
+        include!("postgres_identity_tests.rs");
     }
 }

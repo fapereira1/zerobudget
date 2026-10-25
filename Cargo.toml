@@ -4,6 +4,6 @@ members = [
     "crates/api",
     "crates/auth",
     "crates/cycle",
-    "crates/shared",
+    "crates/infrastructure",
 ]
 resolver = "2"
